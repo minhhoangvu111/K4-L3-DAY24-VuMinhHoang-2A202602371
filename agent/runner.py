@@ -59,10 +59,154 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from agent import ledger, pii, policy, tools
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+_AGENT_ID = "lab24-agent"
+_AGENT_CAPABILITIES = ("search_docs", "read_customer", "http_post")
+_SINK_URL = "http://127.0.0.1:10024/reconcile"
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _args_hash(args: dict) -> str:
+    serialized = json.dumps(args, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _authorize_and_audit(
+    *, path: Path, run_id: str, principal_id: str, expires_at: str,
+    tool_name: str, args: dict, classification: str, purpose: str,
+    scopes: tuple[str, ...], egress_enabled: bool = False,
+) -> bool:
+    context = policy.PolicyContext(
+        data_classification=classification,
+        request_purpose=purpose,
+        agent_owner=f"{_AGENT_ID}/{run_id}",
+        delegation_depth=0,
+        egress_enabled=egress_enabled,
+        principal_id=principal_id,
+        requested_tool=tool_name,
+        agent_scopes=scopes,
+        parent_scopes=(),
+        expires_at=expires_at,
+    )
+    allowed, reason = policy.check(context)
+    ledger.append({
+        "ts": _timestamp(),
+        "agent_id": _AGENT_ID,
+        "run_id": run_id,
+        "tool": tool_name,
+        "args_hash": _args_hash(args),
+        "classification": classification,
+        "decision": "allow" if allowed else "deny",
+        "reason": reason,
+        "on_behalf_of": principal_id,
+        "expires_at": expires_at,
+    }, path)
+    return allowed
+
+
+def _run_a(message: str, llm, *, path: Path, run_id: str,
+           principal_id: str, expires_at: str) -> tuple[tuple[int, ...], str, bool]:
+    """Read untrusted documents, sanitize their content, and emit typed IDs only."""
+    allowed = _authorize_and_audit(
+        path=path,
+        run_id=run_id,
+        principal_id=principal_id,
+        expires_at=expires_at,
+        tool_name="search_docs",
+        args={"query": message},
+        classification="internal",
+        purpose="summarize-tickets",
+        scopes=("search_docs",),
+    )
+    if not allowed:
+        return (), llm.summarize([]), False
+
+    docs = tools.search_docs(message)
+    ticket_ids: set[int] = set()
+    for doc in docs:
+        # File names are produced by search_docs. Ignore arbitrary IDs and
+        # extract only numeric ticket IDs from the expected corpus filename.
+        match = re.fullmatch(r"ticket-(\d+)[a-z]?\.md", Path(doc["id"]).name, re.IGNORECASE)
+        if match:
+            ticket_ids.add(int(match.group(1)))
+
+    sanitized_docs = [
+        {"id": doc["id"], "text": pii.redact(doc["text"])}
+        for doc in docs
+    ]
+    safe_context = "\n\n".join(doc["text"] for doc in sanitized_docs)
+    suspicious = llm.find_injection(safe_context) is not None
+    summary = llm.summarize(sanitized_docs)
+
+    # Only typed IDs and a safe user-facing summary leave Run A. Raw documents,
+    # free text, and customer IDs extracted by the model are deliberately dropped.
+    return tuple(sorted(ticket_ids)), summary, suspicious
+
+
+def _run_b(ticket_ids: tuple[int, ...], *, path: Path, run_id: str,
+           principal_id: str, expires_at: str) -> None:
+    """Resolve trusted ticket relationships, then authorize each customer read."""
+    already_read: set[str] = set()
+    customer_index: list[dict] | None = None
+
+    for ticket_id in ticket_ids:
+        # Authorize before consulting the private customer store. This lets a
+        # denied principal stop at the policy boundary without reading records.
+        if not _authorize_and_audit(
+            path=path,
+            run_id=run_id,
+            principal_id=principal_id,
+            expires_at=expires_at,
+            tool_name="read_customer",
+            args={"ticket_id": ticket_id},
+            classification="restricted",
+            purpose="support-reply",
+            scopes=("read_customer",),
+        ):
+            continue
+
+        if customer_index is None:
+            customer_index = json.loads((DATA_DIR / "customers.json").read_text(encoding="utf-8"))
+
+        related = [
+            str(customer["customer_id"])
+            for customer in customer_index
+            if ticket_id in customer.get("related_tickets", [])
+        ]
+        for customer_id in related:
+            if customer_id in already_read:
+                continue
+            # Check again at the exact tool boundary using the resolved ID.
+            allowed = _authorize_and_audit(
+                path=path,
+                run_id=run_id,
+                principal_id=principal_id,
+                expires_at=expires_at,
+                tool_name="read_customer",
+                args={"customer_id": customer_id},
+                classification="restricted",
+                purpose="support-reply",
+                scopes=("read_customer",),
+            )
+            if allowed:
+                tools.read_customer(customer_id)
+                already_read.add(customer_id)
 
 
 class RunnerScaffoldPending(NotImplementedError):
@@ -71,4 +215,41 @@ class RunnerScaffoldPending(NotImplementedError):
 
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_dir = Path(log_dir) if log_dir is not None else REPORTS_DIR
+    ledger_path = ledger_dir / "ledger.jsonl"
+    run_id = uuid.uuid4().hex
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+
+    ticket_ids, answer, suspicious = _run_a(
+        message,
+        llm,
+        path=ledger_path,
+        run_id=run_id,
+        principal_id=principal_id,
+        expires_at=expires_at,
+    )
+    _run_b(
+        ticket_ids,
+        path=ledger_path,
+        run_id=run_id,
+        principal_id=principal_id,
+        expires_at=expires_at,
+    )
+
+    if suspicious:
+        # The fixed localhost destination keeps the lab harness bounded. The
+        # PEP must deny restricted-data egress before http_post can execute.
+        _authorize_and_audit(
+            path=ledger_path,
+            run_id=run_id,
+            principal_id=principal_id,
+            expires_at=expires_at,
+            tool_name="http_post",
+            args={"url": _SINK_URL},
+            classification="restricted",
+            purpose="support-reply",
+            scopes=("http_post",),
+            egress_enabled=True,
+        )
+
+    return answer

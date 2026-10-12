@@ -34,7 +34,13 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+PRINCIPALS_FILE = Path(__file__).resolve().parent.parent / "data" / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -52,4 +58,50 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Evaluate the mock principal, purpose, expiry, scopes, and egress rule."""
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data cannot use egress"
+
+    if context.data_classification not in {"public", "internal", "restricted"}:
+        return False, "unknown data classification"
+    if context.delegation_depth < 0:
+        return False, "delegation depth cannot be negative"
+    if not context.agent_owner.strip():
+        return False, "agent identity is missing"
+    if not context.principal_id:
+        return False, "principal is missing"
+    if not context.requested_tool:
+        return False, "requested tool is missing"
+
+    try:
+        principals = json.loads(PRINCIPALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "principal fixture is unavailable or invalid"
+
+    principal = principals.get(context.principal_id)
+    if not isinstance(principal, dict):
+        return False, "unknown principal"
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, "purpose is not allowed for this principal"
+
+    try:
+        expires_at = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return False, "run expiry is missing or invalid"
+    if expires_at.tzinfo is None:
+        return False, "run expiry must include a timezone"
+    if expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+        return False, "run has expired"
+
+    principal_tools = set(principal.get("allowed_tools", []))
+    effective_tools = principal_tools.intersection(context.agent_scopes)
+    if context.delegation_depth > 0:
+        if not context.parent_scopes:
+            return False, "delegated run has no parent scope"
+        effective_tools.intersection_update(context.parent_scopes)
+    if context.requested_tool not in effective_tools:
+        return False, "requested tool is outside the effective principal and agent scopes"
+    if context.requested_tool == "http_post" and not context.egress_enabled:
+        return False, "egress is disabled for this run"
+
+    return True, "principal, purpose, expiry, and effective scopes allow this tool"

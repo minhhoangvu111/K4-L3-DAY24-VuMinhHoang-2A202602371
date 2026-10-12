@@ -37,12 +37,66 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
+_GENESIS_HASH = "0" * 64
+
+
+def _digest(entry: dict) -> str:
+    payload = {key: value for key, value in entry.items() if key != "hash"}
+    canonical = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    previous_hash = _GENESIS_HASH
+    if path.exists() and path.stat().st_size:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if lines:
+            try:
+                previous_hash = json.loads(lines[-1])["hash"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                # Preserve a broken chain as broken; verification will reject it.
+                previous_hash = "invalid-previous-hash"
+
+    record = dict(entry)
+    record.pop("hash", None)
+    record["prev_hash"] = previous_hash
+    record["hash"] = _digest(record)
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+        stream.write("\n")
+    return record
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    path = Path(path)
+    if not path.exists():
+        return False
+
+    previous_hash = _GENESIS_HASH
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for raw_line in stream:
+                if not raw_line.strip():
+                    return False
+                record = json.loads(raw_line)
+                if not isinstance(record, dict):
+                    return False
+                if not isinstance(record.get("reason"), str) or not record["reason"].strip():
+                    return False
+                if record.get("prev_hash") != previous_hash:
+                    return False
+                stored_hash = record.get("hash")
+                if not isinstance(stored_hash, str) or stored_hash != _digest(record):
+                    return False
+                previous_hash = stored_hash
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return True

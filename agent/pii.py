@@ -30,10 +30,78 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+import unicodedata
+
+
+_EMAIL = re.compile(
+    r"(?<![\w.+-])[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+"
+    r"(?![\w-])"
+)
+_NUMBER = re.compile(r"(?<!\w)\d(?:[\s.-]?\d){7,15}(?!\w)")
+_BANK_LABEL = re.compile(r"\b(?:stk|tai\s*khoan|bank\s+account|account)\b")
+_PHONE_LABEL = re.compile(r"\b(?:sdt|so\s*dien\s*thoai|dien\s*thoai|phone)\b")
+_CCCD_LABEL = re.compile(r"\b(?:cccd|can\s*cuoc|identity\s*card)\b")
+
+
+def _fold(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in normalized if not unicodedata.combining(char)).lower()
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    """Find synthetic Vietnamese IDs/contact details with character offsets.
+
+    Numeric values are classified using nearby field labels where available:
+    STK/account labels take precedence over the generic 12-digit CCCD shape,
+    while 10/11 digit values starting with 0 are treated as phone numbers.
+    Unlabelled 8-16 digit values are not guessed to be bank accounts, reducing
+    false positives on ticket numbers and other ordinary numeric text.
+    """
+    entities: list[dict] = []
+    email_spans: list[tuple[int, int]] = []
+
+    for match in _EMAIL.finditer(text):
+        start, end = match.span()
+        email_spans.append((start, end))
+        entities.append({"type": "EMAIL", "start": start, "end": end})
+
+    for match in _NUMBER.finditer(text):
+        start, end = match.span()
+        if any(start < email_end and email_start < end for email_start, email_end in email_spans):
+            continue
+
+        value = match.group()
+        digits = re.sub(r"\D", "", value)
+        # Look only within the current clause so a previous field label does not
+        # accidentally classify an unrelated number later in the sentence.
+        prefix = text[max(0, start - 80):start]
+        prefix = re.split(r"[.!?;\n]", prefix)[-1]
+        context = _fold(prefix)
+
+        if 8 <= len(digits) <= 16 and _BANK_LABEL.search(context):
+            entity_type = "VN_BANK_ACCOUNT"
+        elif len(digits) == 12:
+            entity_type = "VN_CCCD"
+        elif digits.startswith("0") and len(digits) in (10, 11):
+            entity_type = "VN_PHONE"
+        elif len(digits) in (10, 11) and _PHONE_LABEL.search(context):
+            entity_type = "VN_PHONE"
+        elif len(digits) == 12 and _CCCD_LABEL.search(context):
+            entity_type = "VN_CCCD"
+        else:
+            continue
+
+        entities.append({"type": entity_type, "start": start, "end": end})
+
+    return sorted(entities, key=lambda item: (item["start"], item["end"], item["type"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    entities = detect(text)
+    for entity in sorted(entities, key=lambda item: item["start"], reverse=True):
+        start, end = entity["start"], entity["end"]
+        text = text[:start] + f"[REDACTED_{entity['type']}]" + text[end:]
+    return text

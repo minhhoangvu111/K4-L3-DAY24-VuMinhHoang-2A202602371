@@ -1,10 +1,14 @@
-# Compliance mapping — điền trong checkpoint 5
+# Compliance mapping (tham chiếu kỹ thuật, không phải kết luận pháp lý)
 
-| Nguồn / yêu cầu | Control đã làm | Evidence file:dòng | Giới hạn |
+Bảng này nối các mục được yêu cầu trong đề với biện pháp mô phỏng và bằng chứng trong repo. Không diễn giải thành kết luận tuân thủ, không gán nghĩa vụ cho điều/khoản cụ thể khi chưa đối chiếu toàn văn chính thức. Luật 91/2025/QH15 và Nghị định 356/2025/NĐ-CP có hiệu lực từ 01-01-2026; Luật 134/2025/QH15 có hiệu lực từ 01-03-2026 theo trang văn bản Chính phủ.
+
+| Nguồn / chủ đề | Control kỹ thuật trong lab | Evidence (file:dòng) | Giới hạn |
 |---|---|---|---|
-| Luật 91/2025/QH15 | | | |
-| NĐ 356/2025/NĐ-CP | | | |
-| Luật AI 134/2025/QH15 | | | |
-| OWASP ASI01, ASI03, ASI04 | | | |
+| Luật Bảo vệ dữ liệu cá nhân 91/2025/QH15 — chủ đề bảo vệ dữ liệu cá nhân | Phân loại hồ sơ khách hàng là `restricted`; phát hiện/redact PII trước khi nội dung đi tiếp; deny egress restricted; audit ghi hash đối số thay vì payload | `agent/runner.py:123-159` (Run A, redact); `agent/pii.py:54-107` (detect/redact); `agent/policy.py:60-106` (policy); `agent/ledger.py:54-102` (ledger); `reports/ledger.jsonl:201` (deny); `reports/attack-after.log` (file rỗng, 0 byte) | Mapping chủ đề, không khẳng định điều/khoản cụ thể hay chứng minh đáp ứng mọi nghĩa vụ pháp lý. Dữ liệu fixture trong lab là synthetic. [Văn bản chính thức](https://vanban.chinhphu.vn/?classid=1&docid=214590&pageid=27160&typegroup=) |
+| Nghị định 356/2025/NĐ-CP — văn bản hướng dẫn thi hành Luật 91/2025 | Ghi nhận data flow, mục đích, principal, đích dữ liệu, quyết định policy và giới hạn vận hành để hỗ trợ rà soát | `reports/dpia-lite.md:1-24`; `agent/runner.py:90-119,216-255`; `reports/ledger.jsonl:201` | Chưa đối chiếu các điều/khoản của nghị định với một triển khai thật; tài liệu DPIA-lite không thay thế hồ sơ đánh giá tác động theo luật. [Văn bản chính thức](https://vanban.chinhphu.vn/?classid=1&docid=216387&pageid=27160) |
+| Luật Trí tuệ nhân tạo 134/2025/QH15 — quản trị rủi ro hệ thống AI | Giới hạn luồng agent bằng split, quyền tối thiểu, PEP trước tool, lưu quyết định phục vụ kiểm tra; mô phỏng xác định, không gọi model/dịch vụ bên ngoài | `agent/runner.py:123-255`; `agent/policy.py:47-112`; `reports/verification.md:1-20` | Chỉ là kiểm soát kỹ thuật trong bài lab; chưa phân loại hệ thống theo luật hoặc xác nhận đáp ứng nghĩa vụ cụ thể. [Văn bản chính thức](https://vanban.chinhphu.vn/?classid=1&docid=216334&pageid=27160) |
+| OWASP ASI01 — Agent Goal Hijack | Xem tài liệu corpus là không tin cậy; chỉ chuyển ticket ID lấy từ tên file qua ranh giới Run A/Run B; dò lure để kiểm chứng | `agent/runner.py:123-160`; `tests/test_injection.py`; `injection-corpus.md:35-116` | Đây là giảm thiểu trong thiết kế mock; không chứng minh chống mọi biến thể injection trong sản phẩm. [OWASP Agentic Top 10](https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/) |
+| OWASP ASI03 — Identity & Privilege Abuse | Principal mô phỏng, purpose/TTL/scope, quyền hiệu lực và deny trước thao tác restricted | `agent/policy.py:47-112`; `agent/runner.py:90-119,162-211`; `tests/test_obo.py`; `reports/ledger.jsonl:201` | `--as dpo` là fixture mô phỏng, không phải xác thực danh tính, quản lý credential hay kiểm soát production. Cùng nguồn OWASP ở trên. |
+| OWASP ASI04 — Agentic Supply Chain Vulnerabilities | Dependency lock có hash; hook Gitleaks pin phiên bản; quét lịch sử và ghi incident | `.pre-commit-config.yaml:1-6`; `requirements.lock` (hash theo từng package); `reports/secrets-incident.md:1-10`; `tests/test_supply_chain.py` | Không đảm bảo dependency an toàn tuyệt đối; lần chạy pre-commit ở môi trường Windows này bị chặn khi tạo cache. ASI04 không thay việc rà soát/provenance ở pipeline thật. Cùng nguồn OWASP ở trên. |
 
-Chỉ ghi điều khoản cụ thể khi đã đối chiếu văn bản gốc. Mô phỏng kỹ thuật không tự chứng minh tuân thủ pháp luật.
+Các số dòng là vị trí trong working tree hiện tại. Kết quả tham chiếu chính: replay `dpo` có `http_post` deny với reason `restricted data cannot use egress` ở dòng ledger cuối; sink sau replay rỗng.
